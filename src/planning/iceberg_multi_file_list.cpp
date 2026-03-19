@@ -421,27 +421,24 @@ IcebergPredicateStats IcebergPredicateStats::DeserializeBounds(const Value &lowe
 //! wrapped in StructExtractFilters, extract the underlying filter and the index
 //! of the column it applies to.
 static std::pair<ColumnIndex, unique_ptr<TableFilter>>
-TryUnwrapStructFilter(const ColumnIndex &index,
-	                  const unique_ptr<TableFilter> &filter,
-				      const vector<unique_ptr<IcebergColumnDefinition>> &schema,
-					  const unordered_map<uint64_t, ColumnIndex> &source_to_column_id) {
+TryUnwrapStructFilter(const ColumnIndex &index, const unique_ptr<TableFilter> &filter,
+                      const vector<unique_ptr<IcebergColumnDefinition>> &schema,
+                      const unordered_map<uint64_t, ColumnIndex> &source_to_column_id) {
 	if (filter->filter_type == TableFilterType::STRUCT_EXTRACT) {
 		auto &struct_extract = filter->Cast<const StructFilter>();
 		auto &column = IcebergTableSchema::GetFromColumnIndex(schema, index, 0);
 		auto &child = column.children.at(struct_extract.child_idx);
-		return TryUnwrapStructFilter(source_to_column_id.at(child->id), struct_extract.child_filter, schema, source_to_column_id);
+		return TryUnwrapStructFilter(source_to_column_id.at(child->id), struct_extract.child_filter, schema,
+		                             source_to_column_id);
 	}
 	return std::make_pair(index, filter->Copy());
 }
 
 //! Invert FilterCombiner::TryPushdownConstantFilter
-static void DecomposeTableFilter(
-	const ColumnIndex &index,
-	const unique_ptr<TableFilter> &filter,
-	TableFilterSet &decomposed_filters,
-	const vector<unique_ptr<IcebergColumnDefinition>> &schema,
-	const unordered_map<uint64_t, ColumnIndex> &source_to_column_id
-) {
+static void DecomposeTableFilter(const ColumnIndex &index, const unique_ptr<TableFilter> &filter,
+                                 TableFilterSet &decomposed_filters,
+                                 const vector<unique_ptr<IcebergColumnDefinition>> &schema,
+                                 const unordered_map<uint64_t, ColumnIndex> &source_to_column_id) {
 	//! Orthogonal filters may have been combined after wrapping in StructFilter.
 	//! Rebuild the filter set using individual column ids.
 	if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
@@ -472,10 +469,10 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestEntry &manifes
 	//! are indexes into the top-level columns, the keys of decomposed_filters.filters are field
 	//! ids in the schema.
 	TableFilterSet decomposed_filters;
-	for (auto &entry: table_filters.filters) {
+	for (auto &entry : table_filters.filters) {
 		DecomposeTableFilter(ColumnIndex(entry.first), entry.second, decomposed_filters, schema, source_to_column_id);
 	}
-	
+
 	auto &metadata = GetMetadata();
 	auto &data_file = manifest_entry.data_file;
 	// First check if there are partitions
@@ -484,14 +481,13 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestEntry &manifes
 		auto partition_spec_it = metadata.partition_specs.find(manifest_entry.partition_spec_id);
 		if (partition_spec_it == metadata.partition_specs.end()) {
 			throw InvalidConfigurationException(
-				"Data file %s has partition spec %d while the metadata does not have this partition spec",
-				data_file.file_path, manifest_entry.partition_spec_id);
+			    "Data file %s has partition spec %d while the metadata does not have this partition spec",
+			    data_file.file_path, manifest_entry.partition_spec_id);
 		}
 		auto &partition_spec = partition_spec_it->second;
 
 		auto &field_summaries = partition_spec.fields;
 		for (auto &field : partition_spec.fields) {
-
 			// Find if we have a filter for this source column
 			auto filter_it = decomposed_filters.filters.find(field.source_id);
 			if (filter_it == decomposed_filters.filters.end()) {
@@ -540,8 +536,7 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestEntry &manifes
 			}
 		}
 	}
-	if (data_file.lower_bounds.empty() || data_file.upper_bounds.empty() ||
-		file_type == IcebergDataFileType::DELETE) {
+	if (data_file.lower_bounds.empty() || data_file.upper_bounds.empty() || file_type == IcebergDataFileType::DELETE) {
 		// There are no bounds statistics for the file, can't filter,
 		// or it is a delete file, which should only be filtered on partitions
 		return true;
