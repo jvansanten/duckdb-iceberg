@@ -101,7 +101,7 @@ public:
 
 	void Bind(vector<LogicalType> &return_types, vector<string> &names);
 	unique_ptr<IcebergMultiFileList> PushdownInternal(ClientContext &context, TableFilterSet &new_filters,
-	                                                  vector<column_t> column_indexes) const;
+	                                                  const vector<ColumnIndex> &column_indexes) const;
 	void ScanPositionalDeleteFile(const BoundIcebergManifestEntry &manifest_entry, DataChunk &result) const;
 	void ScanEqualityDeleteFile(const BoundIcebergManifestEntry &manifest_entry, DataChunk &result,
 	                            vector<MultiFileColumnDefinition> &columns,
@@ -191,6 +191,10 @@ public:
 	mutable bool initialized = false;
 	mutable bool scanned_delete_manifests = false;
 	const IcebergOptions &options;
+
+private:
+	//! ComplexFilterPushdown results
+	vector<ColumnIndex> projected_indexes;
 
 public:
 	//! References to items inside the 'manifest_entries' of the list entries in the 'delete_manifests'

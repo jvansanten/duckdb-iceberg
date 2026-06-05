@@ -348,31 +348,36 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<string
 	this->types = return_types;
 }
 
-unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientContext &context,
-                                                                        TableFilterSet &new_filters,
-                                                                        vector<column_t> column_indexes) const {
+unique_ptr<IcebergMultiFileList>
+IcebergMultiFileList::PushdownInternal(ClientContext &context, TableFilterSet &new_filters,
+                                       const vector<ColumnIndex> &column_indexes) const {
 	auto filtered_list = make_uniq<IcebergMultiFileList>(context, scan_info, path, this->options);
 
 	IcebergTableFilters result_filter_set;
 
-	// Add pre-existing filters
+	// Add pre-existing filters if they are still relevant (i.e. if they reference columns that are still projected)
 	for (auto &entry : table_filters) {
-		result_filter_set.PushFilter(entry.first, entry.second->Copy());
+		if (entry.first < column_indexes.size()) {
+			result_filter_set.PushFilter(entry.first, entry.second->Copy());
+		}
 	}
-
 	// Add new filters
 	for (auto &entry : new_filters) {
-		auto column_idx = column_indexes[entry.GetIndex().GetIndex()];
-		if (column_idx < names.size()) {
+		const auto &column_idx = column_indexes[entry.GetIndex()];
+		const auto &column = IcebergTableSchema::GetFromColumnIndex(GetSchema().columns, column_idx, 0);
+
+		//! Only push down filters for columns that are actually projected
+		if (entry.GetIndex() < column_indexes.size()) {
 			auto &filter =
 			    ExpressionFilter::GetExpressionFilter(entry.Filter(), "IcebergMultiFileList::PushdownInternal");
-			result_filter_set.PushFilter(column_idx, filter.Copy());
+			result_filter_set.PushFilter(entry.GetIndex(), filter.Copy());
 		}
 	}
 
 	filtered_list->table_filters = std::move(result_filter_set);
 	filtered_list->names = names;
 	filtered_list->types = types;
+	filtered_list->projected_indexes = column_indexes;
 	filtered_list->have_bound = true;
 	return filtered_list;
 }
@@ -398,8 +403,19 @@ IcebergMultiFileList::DynamicFilterPushdown(ClientContext &context, const MultiF
 		filters_copy.PushFilter(entry.GetIndex(), filter.Copy());
 	}
 
+	// DynamicFilterPushdown only gets the column indexes of the top-level
+	// columns, no the full ColumnIndex that might contain pushdown-extract
+	// information. Here we fake ColumnIndexes with just the top-level column
+	// index to be able to call PushdownInternal, but these filters will not
+	// reject any files based on nested columns.
+	vector<ColumnIndex> fake_column_indexes;
+	for (auto column_id : column_ids) {
+		fake_column_indexes.emplace_back(column_id);
+	}
+
 	if (filters_copy.HasFilters()) {
-		auto new_snap = PushdownInternal(context, filters_copy, column_ids);
+		auto new_snap = PushdownInternal(
+		    context, filters_copy, this->projected_indexes.empty() ? fake_column_indexes : this->projected_indexes);
 		return std::move(new_snap);
 	}
 	return nullptr;
@@ -424,7 +440,7 @@ unique_ptr<MultiFileList> IcebergMultiFileList::ComplexFilterPushdown(ClientCont
 		return nullptr;
 	}
 
-	return PushdownInternal(context, filter_set, info.column_ids);
+	return PushdownInternal(context, filter_set, info.column_indexes);
 }
 
 vector<OpenFileInfo> IcebergMultiFileList::GetAllFiles() const {
@@ -596,9 +612,15 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 		}
 	}
 
+	unordered_map<uint64_t, ColumnIndex> source_to_column_id;
+	IcebergTableSchema::PopulateSourceIdMap(source_to_column_id, schema, nullptr);
+
+	static bool dumped = false;
+
 	for (auto &entry : table_filters) {
-		auto index = entry.first;
-		auto &column = *schema[index];
+		auto &column_index = projected_indexes.at(entry.first);
+		auto &column = IcebergTableSchema::GetFromColumnIndex(schema, column_index, 0);
+		auto &table_filter = entry.second;
 
 		auto &data_file = manifest_entry.data_file;
 		// First check if there are partitions
@@ -611,17 +633,13 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 				    data_file.file_path, manifest_file.partition_spec_id);
 			}
 			auto &partition_spec = partition_spec_it->second;
-			unordered_map<uint64_t, ColumnIndex> source_to_column_id;
-			IcebergTableSchema::PopulateSourceIdMap(source_to_column_id, schema, nullptr);
 
 			auto &field_summaries = partition_spec.fields;
 			for (idx_t i = 0; i < field_summaries.size(); i++) {
 				auto &field = partition_spec.fields[i];
 
-				const auto &column_id = source_to_column_id.at(field.source_id);
-				// Find if we have a filter for this source column
-				auto table_filter = GetFilterForColumnIndex(table_filters, column_id);
-				if (!table_filter) {
+				if (field.source_id != column.id) {
+					// This partition field is not for the column we are looking at
 					continue;
 				}
 
@@ -651,7 +669,7 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 					continue;
 				}
 
-				auto nan_counts_it = data_file.nan_value_counts.find(column_id.GetPrimaryIndex());
+				auto nan_counts_it = data_file.nan_value_counts.find(column.id);
 				if (nan_counts_it != data_file.nan_value_counts.end()) {
 					auto &nan_counts = nan_counts_it->second;
 					stats.has_nan = nan_counts != 0;
@@ -659,17 +677,16 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 
 				// if the filter doesn't match the partition value, we don't need to scan the data file
 				if (!IcebergPredicate::MatchBounds(context, *table_filter, stats, field.transform)) {
-					auto &source_column = IcebergTableSchema::GetFromColumnIndex(schema, column_id, 0);
 					auto partition_value_raw_str = stats.has_lower_bounds ? stats.lower_bound.ToString() : "NULL";
 					auto partition_value_transformed_str =
 					    stats.has_lower_bounds ? field.transform.PartitionValueToString(stats.lower_bound) : "NULL";
-					DUCKDB_LOG(
-					    context, IcebergLogType,
-					    "Iceberg Filter Pushdown, skipped 'data_file': '%s', partition column '%s' has raw value %s "
-					    "with transform '%s'. '%s(%s)=%s' does not match filter: %s",
-					    data_file.file_path, source_column.name, partition_value_raw_str, field.transform.RawType(),
-					    field.transform.RawType(), partition_value_raw_str, partition_value_transformed_str,
-					    table_filter->ToString(source_column.name));
+					DUCKDB_LOG(context, IcebergLogType,
+					           "Iceberg Filter Pushdown, skipped 'data_file': '%s', partition column '%s' has raw "
+					           "value %s "
+					           "with transform '%s'. '%s(%s)=%s' does not match filter: %s",
+					           data_file.file_path, column.name, partition_value_raw_str, field.transform.RawType(),
+					           field.transform.RawType(), partition_value_raw_str, partition_value_transformed_str,
+					           table_filter->ToString(column.name));
 					return false;
 				}
 			}
@@ -681,8 +698,7 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 			continue;
 		}
 
-		auto &column_id = column.id;
-		if (!metadata.mappings.empty() && mapping_field_ids.find(column_id) == mapping_field_ids.end()) {
+		if (!metadata.mappings.empty() && mapping_field_ids.find(column.id) == mapping_field_ids.end()) {
 			// The name-mapping isn't empty, but it doesn't contain this field.
 			// We take the conservative approach and assume that the name mapping is required to resolve this field.
 			// i.e: assume all of these are true:
@@ -694,8 +710,8 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 			continue;
 		}
 
-		auto lower_bound_it = data_file.lower_bounds.find(column_id);
-		auto upper_bound_it = data_file.upper_bounds.find(column_id);
+		auto lower_bound_it = data_file.lower_bounds.find(column.id);
+		auto upper_bound_it = data_file.upper_bounds.find(column.id);
 		Value lower_bound;
 		Value upper_bound;
 		if (lower_bound_it != data_file.lower_bounds.end()) {
@@ -709,13 +725,13 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 
 		int64_t value_count = 0;
 		bool has_value_counts = false;
-		auto value_counts_it = data_file.value_counts.find(column_id);
+		auto value_counts_it = data_file.value_counts.find(column.id);
 		if (value_counts_it != data_file.value_counts.end()) {
 			value_count = value_counts_it->second;
 			has_value_counts = true;
 		}
 
-		auto null_counts_it = data_file.null_value_counts.find(column_id);
+		auto null_counts_it = data_file.null_value_counts.find(column.id);
 		if (null_counts_it != data_file.null_value_counts.end()) {
 			auto &null_counts = null_counts_it->second;
 			stats.has_null = null_counts != 0;
@@ -735,20 +751,20 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 			}
 		}
 
-		auto nan_counts_it = data_file.nan_value_counts.find(column_id);
+		auto nan_counts_it = data_file.nan_value_counts.find(column.id);
 		if (nan_counts_it != data_file.nan_value_counts.end()) {
 			auto &nan_counts = nan_counts_it->second;
 			stats.has_nan = nan_counts != 0;
 		}
 
-		auto &filter = *entry.second;
-		if (!IcebergPredicate::MatchBounds(context, filter, stats, IcebergTransform::Identity())) {
+		if (!IcebergPredicate::MatchBounds(context, *table_filter, stats, IcebergTransform::Identity())) {
 			//! If any predicate fails, exclude the file
 			DUCKDB_LOG(context, IcebergLogType,
 			           "Iceberg Filter Pushdown, skipped 'data_file': '%s', column '%s' with "
 			           "bounds [%s, %s] did not match filter: %s",
 			           data_file.file_path, column.name, stats.has_lower_bounds ? stats.lower_bound.ToString() : "N/A",
-			           stats.has_upper_bounds ? stats.upper_bound.ToString() : "N/A", filter.ToString(column.name));
+			           stats.has_upper_bounds ? stats.upper_bound.ToString() : "N/A",
+			           table_filter->ToString(column.name));
 			return false;
 		}
 	}
@@ -980,15 +996,15 @@ IcebergMultiFileList::GetEqualityDeletesForFile(const BoundIcebergManifestEntry 
 			auto &partition_spec = metadata.partition_specs.at(file.partition_spec_id);
 			if (partition_spec.IsPartitioned()) {
 				if (file.partition_spec_id != manifest_file.partition_spec_id) {
-					//! Not unpartitioned and the data does not share the same partition spec as the delete, skip the
-					//! delete file.
+					//! Not unpartitioned and the data does not share the same partition spec as the delete, skip
+					//! the delete file.
 					continue;
 				}
 				D_ASSERT(file.partition_info.size() == data_file.partition_info.size());
 				for (idx_t i = 0; i < file.partition_info.size(); i++) {
 					if (file.partition_info[i] != data_file.partition_info[i]) {
-						//! Same partition spec id, but the partitioning information doesn't match, delete file doesn't
-						//! apply.
+						//! Same partition spec id, but the partitioning information doesn't match, delete file
+						//! doesn't apply.
 						continue;
 					}
 				}
